@@ -1,4 +1,9 @@
-﻿using UnityEngine.SceneManagement;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using UnityEngine;
+using UnityEngine.SceneManagement;
 
 #nullable enable
 
@@ -31,7 +36,6 @@ public static class SceneHandler
 
     /// <summary>All currently loaded Scenes.</summary>
     public static List<Scene> LoadedScenes { get; private set; } = new();
-    //private static HashSet<Scene> previousLoadedScenes;
 
     /// <summary>The names of all scenes in the build settings, if they could be retrieved.</summary>
     public static List<string> AllSceneNames { get; private set; } = new();
@@ -46,7 +50,8 @@ public static class SceneHandler
     internal static int DefaultSceneCount => 1 + (DontDestroyExists ? 1 : 0);
 
     /// <summary>Whether or not we are currently inspecting the "HideAndDontSave" asset scene.</summary>
-    public static bool InspectingAssetScene => SelectedScene.HasValue && SelectedScene.Value.handle == -1;
+    // UNITY 6 FIX: Replaced .handle == -1 with !IsValid()
+    public static bool InspectingAssetScene => SelectedScene.HasValue && !SelectedScene.Value.IsValid();
 
     /// <summary>Whether or not we successfuly retrieved the names of the scenes in the build settings.</summary>
     public static bool WasAbleToGetScenesInBuild { get; private set; }
@@ -67,7 +72,10 @@ public static class SceneHandler
                 throw new Exception("This version of Unity does not ship with the 'Scene' class, or it was not unstripped.");
             }
             MethodInfo? method = sceneType.GetMethod("GetNameInternal", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-            string? sceneName = (string?)method?.Invoke(null, [-12]);
+            
+            // Note: This will throw in Unity 6 because the parameter type changed to SceneHandle.
+            // That is expected and handled by the catch block below.
+            string? sceneName = (string?)method?.Invoke(null, new object[] { -12 });
             if (string.IsNullOrEmpty(sceneName))
             {
                 throw new Exception("Scene.GetNameInternal returned null for DontDestroyOnLoad scene.");
@@ -77,11 +85,10 @@ public static class SceneHandler
         catch (Exception ex)
         {
             ExplorerCore.LogWarning($"Unable to check for existence of DontDestroyOnLoad scene via Scene.GetNameInternal: {ex}");
-#pragma warning disable CS0618 // 型またはメンバーが旧型式です
-            ExplorerCore.LogWarning("Falling back to checking loaded scenes for DontDestroyOnLoad via SceneManager.GetAllScenes(). This uses a deprecated API.");
-            // 非推奨APIだけど、6年近くたってもまだ使われてるので仕方なく使う
+#pragma warning disable CS0618 // Type or member is obsolete
+            ExplorerCore.LogWarning("Falling back to checking loaded scenes for DontDestroyOnLoad via SceneManager.GetAllScenes().");
             DontDestroyExists = SceneManager.GetAllScenes().Any(s => s.name == dontDestroyName);
-#pragma warning restore CS0618 // 型またはメンバーが旧型式です
+#pragma warning restore CS0618 // Type or member is obsolete
         }
 
         // Try to get all scenes in the build settings. This may not work.
@@ -97,7 +104,7 @@ public static class SceneHandler
             int sceneCount = SceneManager.sceneCountInBuildSettings;
             for (int i = 0; i < sceneCount; i++)
             {
-                string? scenePath = (string?)method?.Invoke(null, [ i ]);
+                string? scenePath = (string?)method?.Invoke(null, new object[] { i });
                 if (string.IsNullOrEmpty(scenePath))
                 {
                     continue;
@@ -116,24 +123,24 @@ public static class SceneHandler
 
     internal static void Update()
     {
-        // Inspected scene will exist if it's DontDestroyOnLoad or HideAndDontSave
+        // UNITY 6 FIX: Check by name and validity instead of hardcoded handle integers
         bool inspectedExists =
             SelectedScene.HasValue
-            && ((DontDestroyExists && SelectedScene.Value.handle == -12)
-                || SelectedScene.Value.handle == -1);
+            && ((DontDestroyExists && SelectedScene.Value.name == dontDestroyName)
+                || !SelectedScene.Value.IsValid());
 
         LoadedScenes.Clear();
 
         for (int i = 0; i < SceneManager.sceneCount; i++)
         {
             Scene scene = SceneManager.GetSceneAt(i);
-            if (scene == default || !scene.isLoaded || !scene.IsValid())
+            if (!scene.isLoaded || !scene.IsValid())
             {
                 continue;
             }
 
             // If we have not yet confirmed inspectedExists, check if this scene is our currently inspected one.
-            if (!inspectedExists && scene == SelectedScene)
+            if (!inspectedExists && SelectedScene.HasValue && scene == SelectedScene.Value)
             {
                 inspectedExists = true;
             }
@@ -143,14 +150,23 @@ public static class SceneHandler
 
         if (DontDestroyExists)
         {
-            LoadedScenes.Add(new Scene { m_Handle = -12 });
+            // UNITY 6 FIX: We can no longer reliably create a fake Scene with m_Handle = -12.
+            // Instead, try to find the actual DDOL scene by name.
+            var ddolScene = SceneManager.GetAllScenes().FirstOrDefault(s => s.name == dontDestroyName);
+            if (ddolScene.IsValid() && !LoadedScenes.Contains(ddolScene))
+            {
+                LoadedScenes.Add(ddolScene);
+            }
         }
-        LoadedScenes.Add(new Scene { m_Handle = -1 });
+        
+        // UNITY 6 FIX: Add a placeholder for the "HideAndDontSave" asset scene.
+        // default(Scene) is invalid, which perfectly matches our InspectingAssetScene check above.
+        LoadedScenes.Add(default);
 
         // Default to first scene if none selected or previous selection no longer exists.
         if (!inspectedExists)
         {
-            SelectedScene = LoadedScenes.First();
+            SelectedScene = LoadedScenes.Count > 0 ? LoadedScenes.First() : default;
         }
 
         // Notify on the list changing at all
@@ -167,8 +183,7 @@ public static class SceneHandler
             List<GameObject> objects = new();
             foreach (UnityEngine.Object obj in allObjects)
             {
-                GameObject? go = obj.TryCast<GameObject>();
-                if (go != null &&
+                if (obj is GameObject go &&
                     go.transform != null &&
                     go.transform.parent == null && 
                     !go.scene.IsValid())
